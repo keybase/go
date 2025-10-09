@@ -1050,7 +1050,7 @@ func (p *Package) writeExports(fgo2, fm, fgcc, fgcch io.Writer) {
 		// The struct should be aligned to the maximum alignment
 		// of any of its fields. This to avoid alignment
 		// issues.
-		fmt.Fprintf(fgcc, "\ttypedef %s %v __attribute__((aligned(%d))) _cgo_argtype;\n", ctype.String(), p.packedAttribute(), maxAlign)
+		fmt.Fprintf(fgcc, "\ttypedef %s %v __attribute__((aligned(%d))) _cgo_argtype;\n", ctype, p.packedAttribute(), maxAlign)
 		fmt.Fprintf(fgcc, "\tstatic _cgo_argtype _cgo_zero;\n")
 		fmt.Fprintf(fgcc, "\t_cgo_argtype _cgo_a = _cgo_zero;\n")
 		if gccResult != "void" && (len(fntype.Results.List) > 1 || len(fntype.Results.List[0].Names) > 1) {
