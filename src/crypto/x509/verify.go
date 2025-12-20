@@ -110,31 +110,38 @@ type HostnameError struct {
 
 func (h HostnameError) Error() string {
 	c := h.Certificate
+	maxNamesIncluded := 100
 
 	if !c.hasSANExtension() && matchHostnames(c.Subject.CommonName, h.Host) {
 		return "x509: certificate relies on legacy Common Name field, use SANs instead"
 	}
 
-	var valid string
+	var valid strings.Builder
 	if ip := net.ParseIP(h.Host); ip != nil {
 		// Trying to validate an IP
 		if len(c.IPAddresses) == 0 {
 			return "x509: cannot validate certificate for " + h.Host + " because it doesn't contain any IP SANs"
 		}
+		if len(c.IPAddresses) >= maxNamesIncluded {
+			return fmt.Sprintf("x509: certificate is valid for %d IP SANs, but none matched %s", len(c.IPAddresses), h.Host)
+		}
 		for _, san := range c.IPAddresses {
-			if len(valid) > 0 {
-				valid += ", "
+			if valid.Len() > 0 {
+				valid.WriteString(", ")
 			}
-			valid += san.String()
+			valid.WriteString(san.String())
 		}
 	} else {
-		valid = strings.Join(c.DNSNames, ", ")
+		if len(c.DNSNames) >= maxNamesIncluded {
+			return fmt.Sprintf("x509: certificate is valid for %d names, but none matched %s", len(c.DNSNames), h.Host)
+		}
+		valid.WriteString(strings.Join(c.DNSNames, ", "))
 	}
 
-	if len(valid) == 0 {
+	if valid.Len() == 0 {
 		return "x509: certificate is not valid for any names, but wanted to match " + h.Host
 	}
-	return "x509: certificate is valid for " + valid + ", not " + h.Host
+	return "x509: certificate is valid for " + valid.String() + ", not " + h.Host
 }
 
 // UnknownAuthorityError results when the certificate issuer is unknown
@@ -391,6 +398,7 @@ func parseRFC2821Mailbox(in string) (mailbox rfc2821Mailbox, ok bool) {
 // domainToReverseLabels converts a textual domain name like foo.example.com to
 // the list of labels in reverse order, e.g. ["com", "example", "foo"].
 func domainToReverseLabels(domain string) (reverseLabels []string, ok bool) {
+	reverseLabels = make([]string, 0, strings.Count(domain, ".")+1)
 	for len(domain) > 0 {
 		if i := strings.LastIndexByte(domain, '.'); i == -1 {
 			reverseLabels = append(reverseLabels, domain)
@@ -428,7 +436,7 @@ func domainToReverseLabels(domain string) (reverseLabels []string, ok bool) {
 	return reverseLabels, true
 }
 
-func matchEmailConstraint(mailbox rfc2821Mailbox, constraint string) (bool, error) {
+func matchEmailConstraint(mailbox rfc2821Mailbox, constraint string, excluded bool, reversedDomainsCache map[string][]string, reversedConstraintsCache map[string][]string) (bool, error) {
 	// If the constraint contains an @, then it specifies an exact mailbox
 	// name.
 	if strings.Contains(constraint, "@") {
@@ -441,10 +449,10 @@ func matchEmailConstraint(mailbox rfc2821Mailbox, constraint string) (bool, erro
 
 	// Otherwise the constraint is like a DNS constraint of the domain part
 	// of the mailbox.
-	return matchDomainConstraint(mailbox.domain, constraint)
+	return matchDomainConstraint(mailbox.domain, constraint, excluded, reversedDomainsCache, reversedConstraintsCache)
 }
 
-func matchURIConstraint(uri *url.URL, constraint string) (bool, error) {
+func matchURIConstraint(uri *url.URL, constraint string, excluded bool, reversedDomainsCache map[string][]string, reversedConstraintsCache map[string][]string) (bool, error) {
 	// From RFC 5280, Section 4.2.1.10:
 	// “a uniformResourceIdentifier that does not include an authority
 	// component with a host name specified as a fully qualified domain
@@ -473,7 +481,7 @@ func matchURIConstraint(uri *url.URL, constraint string) (bool, error) {
 		return false, fmt.Errorf("URI with IP (%q) cannot be matched against constraints", uri.String())
 	}
 
-	return matchDomainConstraint(host, constraint)
+	return matchDomainConstraint(host, constraint, excluded, reversedDomainsCache, reversedConstraintsCache)
 }
 
 func matchIPConstraint(ip net.IP, constraint *net.IPNet) (bool, error) {
@@ -490,16 +498,26 @@ func matchIPConstraint(ip net.IP, constraint *net.IPNet) (bool, error) {
 	return true, nil
 }
 
-func matchDomainConstraint(domain, constraint string) (bool, error) {
+func matchDomainConstraint(domain, constraint string, excluded bool, reversedDomainsCache map[string][]string, reversedConstraintsCache map[string][]string) (bool, error) {
 	// The meaning of zero length constraints is not specified, but this
 	// code follows NSS and accepts them as matching everything.
 	if len(constraint) == 0 {
 		return true, nil
 	}
 
-	domainLabels, ok := domainToReverseLabels(domain)
-	if !ok {
-		return false, fmt.Errorf("x509: internal error: cannot parse domain %q", domain)
+	domainLabels, found := reversedDomainsCache[domain]
+	if !found {
+		var ok bool
+		domainLabels, ok = domainToReverseLabels(domain)
+		if !ok {
+			return false, fmt.Errorf("x509: internal error: cannot parse domain %q", domain)
+		}
+		reversedDomainsCache[domain] = domainLabels
+	}
+
+	wildcardDomain := false
+	if len(domain) > 0 && domain[0] == '*' {
+		wildcardDomain = true
 	}
 
 	// RFC 5280 says that a leading period in a domain name means that at
@@ -513,14 +531,24 @@ func matchDomainConstraint(domain, constraint string) (bool, error) {
 		constraint = constraint[1:]
 	}
 
-	constraintLabels, ok := domainToReverseLabels(constraint)
-	if !ok {
-		return false, fmt.Errorf("x509: internal error: cannot parse domain %q", constraint)
+	constraintLabels, found := reversedConstraintsCache[constraint]
+	if !found {
+		var ok bool
+		constraintLabels, ok = domainToReverseLabels(constraint)
+		if !ok {
+			return false, fmt.Errorf("x509: internal error: cannot parse domain %q", constraint)
+		}
+		reversedConstraintsCache[constraint] = constraintLabels
 	}
 
 	if len(domainLabels) < len(constraintLabels) ||
 		(mustHaveSubdomains && len(domainLabels) == len(constraintLabels)) {
 		return false, nil
+	}
+
+	if excluded && wildcardDomain && len(domainLabels) > 1 && len(constraintLabels) > 0 {
+		domainLabels = domainLabels[:len(domainLabels)-1]
+		constraintLabels = constraintLabels[:len(constraintLabels)-1]
 	}
 
 	for i, constraintLabel := range constraintLabels {
@@ -542,7 +570,7 @@ func (c *Certificate) checkNameConstraints(count *int,
 	nameType string,
 	name string,
 	parsedName any,
-	match func(parsedName, constraint any) (match bool, err error),
+	match func(parsedName, constraint any, excluded bool) (match bool, err error),
 	permitted, excluded any) error {
 
 	excludedValue := reflect.ValueOf(excluded)
@@ -554,7 +582,7 @@ func (c *Certificate) checkNameConstraints(count *int,
 
 	for i := 0; i < excludedValue.Len(); i++ {
 		constraint := excludedValue.Index(i).Interface()
-		match, err := match(parsedName, constraint)
+		match, err := match(parsedName, constraint, true)
 		if err != nil {
 			return CertificateInvalidError{c, CANotAuthorizedForThisName, err.Error()}
 		}
@@ -576,7 +604,7 @@ func (c *Certificate) checkNameConstraints(count *int,
 		constraint := permittedValue.Index(i).Interface()
 
 		var err error
-		if ok, err = match(parsedName, constraint); err != nil {
+		if ok, err = match(parsedName, constraint, false); err != nil {
 			return CertificateInvalidError{c, CANotAuthorizedForThisName, err.Error()}
 		}
 
@@ -636,6 +664,19 @@ func (c *Certificate) isValid(certType int, currentChain []*Certificate, opts *V
 		}
 	}
 
+	// Each time we do constraint checking, we need to check the constraints in
+	// the current certificate against all of the names that preceded it. We
+	// reverse these names using domainToReverseLabels, which is a relatively
+	// expensive operation. Since we check each name against each constraint,
+	// this requires us to do N*C calls to domainToReverseLabels (where N is the
+	// total number of names that preceed the certificate, and C is the total
+	// number of constraints in the certificate). By caching the results of
+	// calling domainToReverseLabels, we can reduce that to N+C calls at the
+	// cost of keeping all of the parsed names and constraints in memory until
+	// we return from isValid.
+	reversedDomainsCache := map[string][]string{}
+	reversedConstraintsCache := map[string][]string{}
+
 	if (certType == intermediateCertificate || certType == rootCertificate) &&
 		c.hasNameConstraints() {
 		toCheck := []*Certificate{}
@@ -655,21 +696,21 @@ func (c *Certificate) isValid(certType int, currentChain []*Certificate, opts *V
 					}
 
 					if err := c.checkNameConstraints(&comparisonCount, maxConstraintComparisons, "email address", name, mailbox,
-						func(parsedName, constraint any) (bool, error) {
-							return matchEmailConstraint(parsedName.(rfc2821Mailbox), constraint.(string))
+						func(parsedName, constraint any, excluded bool) (bool, error) {
+							return matchEmailConstraint(parsedName.(rfc2821Mailbox), constraint.(string), excluded, reversedDomainsCache, reversedConstraintsCache)
 						}, c.PermittedEmailAddresses, c.ExcludedEmailAddresses); err != nil {
 						return err
 					}
 
 				case nameTypeDNS:
 					name := string(data)
-					if _, ok := domainToReverseLabels(name); !ok {
+					if !domainNameValid(name, false) {
 						return fmt.Errorf("x509: cannot parse dnsName %q", name)
 					}
 
 					if err := c.checkNameConstraints(&comparisonCount, maxConstraintComparisons, "DNS name", name, name,
-						func(parsedName, constraint any) (bool, error) {
-							return matchDomainConstraint(parsedName.(string), constraint.(string))
+						func(parsedName, constraint any, excluded bool) (bool, error) {
+							return matchDomainConstraint(parsedName.(string), constraint.(string), excluded, reversedDomainsCache, reversedConstraintsCache)
 						}, c.PermittedDNSDomains, c.ExcludedDNSDomains); err != nil {
 						return err
 					}
@@ -682,8 +723,8 @@ func (c *Certificate) isValid(certType int, currentChain []*Certificate, opts *V
 					}
 
 					if err := c.checkNameConstraints(&comparisonCount, maxConstraintComparisons, "URI", name, uri,
-						func(parsedName, constraint any) (bool, error) {
-							return matchURIConstraint(parsedName.(*url.URL), constraint.(string))
+						func(parsedName, constraint any, excluded bool) (bool, error) {
+							return matchURIConstraint(parsedName.(*url.URL), constraint.(string), excluded, reversedDomainsCache, reversedConstraintsCache)
 						}, c.PermittedURIDomains, c.ExcludedURIDomains); err != nil {
 						return err
 					}
@@ -695,7 +736,7 @@ func (c *Certificate) isValid(certType int, currentChain []*Certificate, opts *V
 					}
 
 					if err := c.checkNameConstraints(&comparisonCount, maxConstraintComparisons, "IP address", ip.String(), ip,
-						func(parsedName, constraint any) (bool, error) {
+						func(parsedName, constraint any, _ bool) (bool, error) {
 							return matchIPConstraint(parsedName.(net.IP), constraint.(*net.IPNet))
 						}, c.PermittedIPRanges, c.ExcludedIPRanges); err != nil {
 						return err
@@ -927,7 +968,10 @@ func alreadyInChain(candidate *Certificate, chain []*Certificate) bool {
 		if !bytes.Equal(candidate.RawSubject, cert.RawSubject) {
 			continue
 		}
-		if !candidate.PublicKey.(pubKeyEqual).Equal(cert.PublicKey) {
+		// We enforce the canonical encoding of SPKI (by only allowing the
+		// correct AI paremeter encodings in parseCertificate), so it's safe to
+		// directly compare the raw bytes.
+		if !bytes.Equal(candidate.RawSubjectPublicKeyInfo, cert.RawSubjectPublicKeyInfo) {
 			continue
 		}
 		var certSAN *pkix.Extension
